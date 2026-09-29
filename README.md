@@ -2,32 +2,41 @@
 
 Upload a photo, PDF or forwarded email (.eml) of a receipt. A vision model reads it, categorises it, checks the numbers, and anything doubtful goes to a Review queue. Originals are stored encrypted.
 
-## Run
+## What it does
+
+- **Phone:** installable web app with a "Snap a receipt" camera button, multi-page receipts, an offline queue, and Share-to-app on Android.
+- **Email:** forward a receipt to a dedicated mailbox; the app checks it over IMAP. Only allowed, verified senders are read.
+- **Background reading:** uploads return at once; a worker reads each receipt with the model, so slow networks or model errors never lose a file.
+- **Review queue:** anything doubtful is flagged and waits for you; your corrections teach later classifications.
+
+## Run locally
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # then set RT_LLM_API_KEY (and RT_MODEL if not using OpenAI)
+cp .env.example .env            # set RT_LLM_API_KEY (and RT_MODEL if not using OpenAI)
 export $(grep -v '^#' .env | xargs)
 uvicorn app.main:app_factory --factory --port 8000
 ```
 
-Open http://localhost:8000. Without a key (or a local `RT_LLM_BASE_URL`) the app still works: every upload is stored and sent to Review for manual entry.
+Open http://localhost:8000. With no password or token set it is open, which is fine on your own machine only. Without a model key (or a local `RT_LLM_BASE_URL`) every upload is stored and sent to Review for manual entry. Camera and install need HTTPS, so for phones deploy it: **see [docs/DEPLOY_OCI.md](docs/DEPLOY_OCI.md)** (Docker, Caddy, backups, email, iPhone Shortcut).
 
 Tests: `python3 -m pytest -q`
 
 ## Settings (env vars)
 
+Everything is documented in `.env.example`. The main ones:
+
 | Variable | Purpose |
 |---|---|
-| `RT_LLM_API_KEY` | Key for the model provider (`OPENAI_API_KEY` also works). Not needed for local servers |
-| `RT_LLM_BASE_URL` | Any OpenAI-compatible endpoint (default `https://api.openai.com/v1`) |
-| `RT_MODEL` | Vision-capable model name on that provider (default `gpt-4o`) |
-| `RT_PDF_MODE` | `auto` (render PDF pages to images with PyMuPDF, else send the PDF natively), `images`, or `file` |
-| `RT_JSON_MODE` | `0` if your server rejects `response_format=json_object` |
-| `RT_DATA_DIR` | Where the database, encrypted files and key live (default `./data`) |
-| `RT_KEY` | Encryption key (otherwise generated in `data/secret.key`) |
-| `RT_TOKEN` | If set, every API call needs this token (the UI asks for it). Set it if the app is reachable from anywhere but your own machine |
+| `RT_PASSWORD_HASH` | Browser login (`python -m app.auth` creates it) |
+| `RT_TOKEN` | Long-lived API token for scripts and the iOS Shortcut (`Authorization: Bearer`) |
+| `RT_LLM_API_KEY`, `RT_LLM_BASE_URL`, `RT_MODEL` | Model provider (any OpenAI-compatible endpoint) |
+| `RT_PDF_MODE`, `RT_JSON_MODE` | Provider quirks for PDFs and JSON replies |
+| `RT_KEY` | Encryption key for receipts and backups (otherwise generated in `data/secret.key`) |
+| `RT_DATA_DIR` | Database, encrypted files and key location |
+| `RT_IMAP_*`, `RT_MAIL_ALLOWED_SENDERS`, `RT_MAIL_REQUIRE_AUTH` | Email intake |
+| `RT_NTFY_URL` | Phone notifications |
 | `RT_CONFIDENCE_THRESHOLD` | Below this a field is flagged for review (default 0.8) |
 
 ## Switching model provider
@@ -62,10 +71,13 @@ Receipts never need to leave your machine if you use a local model, though small
 
 ## Not built yet
 
-Accounts and sync, mobile app, WhatsApp intake, budgets and alerts, Tally export, multi-user privacy flows.
+Multiple users and sync, native mobile app, WhatsApp intake, budgets and alerts, Tally export, multi-user privacy flows.
 
 ## Known gaps
 
 - **Extraction accuracy is untested.** The request format is tested against a mock server, never a live model or provider. Run about 100 of your real receipts and check the auto-accept rate and error rate before trusting auto-accepted records.
 - The GSTIN checksum was verified against one known sample number only.
-- The UI was smoke-tested in headless Chromium, not on a phone.
+- The phone app was tested in a phone-sized headless Chromium (login, camera input, multi-page, offline queue), not on real Android or iOS devices. Install, camera and Share-to-app behaviour on real phones is unverified.
+- Email intake is tested against a scripted stand-in for an IMAP server, not a real mailbox. Gmail's folder and expunge behaviour is from memory.
+- The Docker and OCI files have not been built or run: no Docker daemon was available where this was written. The compose file validates, and the app runs with the same server flags outside Docker.
+- Backups are tested for round-trip restore locally, not against OCI Object Storage.

@@ -38,10 +38,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     receipt_name TEXT,
     receipt_type TEXT,
     receipt_sha256 TEXT,
+    context TEXT,                          -- email headers passed to the model with an attachment
     field_origin TEXT NOT NULL DEFAULT '{}',
     confidence TEXT NOT NULL DEFAULT '{}',
     flags TEXT NOT NULL DEFAULT '[]',
-    status TEXT NOT NULL,                  -- accepted | needs_review | reviewed
+    status TEXT NOT NULL,                  -- processing | accepted | needs_review | reviewed
     notes TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
@@ -79,6 +80,8 @@ def connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")   # the web server, worker and mail poller write from different threads
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -87,6 +90,9 @@ def init_db(path: Path) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+        if "context" not in cols:  # databases created before background processing
+            conn.execute("ALTER TABLE transactions ADD COLUMN context TEXT")
         if conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
             for parent, children in DEFAULT_CATEGORIES.items():
                 cur = conn.execute("INSERT INTO categories(name, parent_id) VALUES (?, NULL)", (parent,))

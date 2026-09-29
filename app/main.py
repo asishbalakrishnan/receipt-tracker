@@ -1,9 +1,11 @@
 """FastAPI app: JSON API plus the single-page UI."""
 from __future__ import annotations
 
+import hashlib
 import hmac
 import re
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Iterator
 
@@ -11,10 +13,13 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Respo
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import db, service
+from . import auth, db, service
 from .config import Settings
 from .crypto import Vault, load_key
 from .extractor import Extractor, build_extractor
+from .mailbox import MailThread
+from .notify import build_notifier
+from .worker import Worker
 
 STATIC = Path(__file__).parent / "static"
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -45,6 +50,10 @@ class TxnPatch(BaseModel):
     make_rule: bool = False
 
 
+class LoginIn(BaseModel):
+    password: str
+
+
 class CategoryIn(BaseModel):
     name: str
     parent_id: int | None = None
@@ -56,14 +65,38 @@ class RuleIn(BaseModel):
     kind: str | None = None
 
 
-def create_app(settings: Settings | None = None, extractor: Extractor | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, extractor: Extractor | None = None,
+               notify=None, mailbox_factory=None) -> FastAPI:
     settings = settings or Settings()
+    if settings.require_auth and not (settings.password_hash or settings.token):
+        raise RuntimeError("RT_REQUIRE_AUTH is set but neither RT_PASSWORD_HASH nor RT_TOKEN is; refusing to start an open server.")
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(settings.db_path)
-    vault = Vault(settings.files_dir, load_key(settings.data_dir, settings.fernet_key))
+    key = load_key(settings.data_dir, settings.fernet_key)
+    vault = Vault(settings.files_dir, key)
     extractor = extractor or build_extractor(settings)
+    worker = Worker(settings, vault, extractor, notify or build_notifier(settings))
+    mail = MailThread(settings, vault, worker, mailbox_factory) if settings.mail_enabled else None
+    # Sessions die when the password or the encryption key changes.
+    sessions = auth.Sessions(hashlib.sha256(b"session:" + key + settings.password_hash.encode()).digest(),
+                             settings.session_days)
+    limiter = auth.LoginLimiter()
 
-    app = FastAPI(title="Receipt tracker", docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if not settings.sync_ingest:
+            worker.start()
+        if mail:
+            mail.start()
+        yield
+        if mail:
+            mail.stop()
+        worker.stop()
+
+    app = FastAPI(title="Receipt tracker", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.worker = worker
+    app.state.mail = mail
+    app.state.settings = settings
 
     def get_conn() -> Iterator[sqlite3.Connection]:
         conn = db.connect(settings.db_path)
@@ -72,12 +105,24 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
         finally:
             conn.close()
 
-    def require_token(request: Request) -> None:
-        if not settings.token:
-            return
+    def auth_mode() -> str:
+        return "password" if settings.password_hash else "token" if settings.token else "open"
+
+    def token_ok(request: Request) -> bool:
         supplied = request.headers.get("x-token", "")
-        if not hmac.compare_digest(supplied, settings.token):
-            raise HTTPException(status_code=401, detail="Missing or wrong access token")
+        if not supplied and request.headers.get("authorization", "").lower().startswith("bearer "):
+            supplied = request.headers["authorization"][7:]
+        return bool(settings.token) and hmac.compare_digest(supplied, settings.token)
+
+    def require_auth(request: Request) -> None:
+        if auth_mode() == "open" or token_ok(request):
+            return
+        if settings.password_hash and sessions.valid(request.cookies.get(auth.COOKIE)):
+            # Cookie-authenticated writes must come from our own page (defence in depth beside SameSite=Strict).
+            if request.method not in ("GET", "HEAD") and request.headers.get(auth.CSRF_HEADER) != auth.CSRF_VALUE:
+                raise HTTPException(status_code=403, detail="Missing request header")
+            return
+        raise HTTPException(status_code=401, detail="Login required")
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -88,15 +133,62 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
         if request.url.path == "/":
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; "
-                "script-src 'self' 'unsafe-inline'; frame-src blob:; object-src blob:; frame-ancestors 'none'"
+                "script-src 'self' 'unsafe-inline'; frame-src blob:; object-src blob:; frame-ancestors 'none'; "
+                "manifest-src 'self'; worker-src 'self'"
             )
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
         return response
 
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(STATIC / "index.html")
 
-    api = Depends(require_token)
+    @app.get("/manifest.webmanifest", include_in_schema=False)
+    def manifest():
+        return FileResponse(STATIC / "manifest.webmanifest", media_type="application/manifest+json")
+
+    @app.get("/sw.js", include_in_schema=False)
+    def service_worker():
+        return FileResponse(STATIC / "sw.js", media_type="text/javascript")
+
+    @app.get("/icons/{name}", include_in_schema=False)
+    def icon(name: str):
+        path = STATIC / "icons" / name
+        if not re.fullmatch(r"[a-z0-9\-]+\.png", name) or not path.is_file():
+            raise HTTPException(404, "Not found")
+        return FileResponse(path, media_type="image/png")
+
+    api = Depends(require_auth)
+
+    # ---- login
+
+    @app.get("/api/session")
+    def session(request: Request):
+        mode = auth_mode()
+        ok = mode == "open" or token_ok(request) or (
+            bool(settings.password_hash) and sessions.valid(request.cookies.get(auth.COOKIE)))
+        return {"mode": mode, "authenticated": ok}
+
+    @app.post("/api/login")
+    def login(body: LoginIn, request: Request, response: Response):
+        if not settings.password_hash:
+            raise HTTPException(400, "Password login is not enabled on this server")
+        who = request.client.host if request.client else "unknown"
+        if limiter.blocked(who):
+            raise HTTPException(429, "Too many attempts. Try again in a few minutes.")
+        if not auth.verify_password(body.password, settings.password_hash):
+            limiter.fail(who)
+            raise HTTPException(401, "Wrong password")
+        limiter.reset(who)
+        response.set_cookie(auth.COOKIE, sessions.issue(), max_age=sessions.ttl, httponly=True,
+                            samesite="strict", secure=request.url.scheme == "https", path="/")
+        return {"ok": True}
+
+    @app.post("/api/logout")
+    def logout(response: Response):
+        response.delete_cookie(auth.COOKIE, path="/")
+        return {"ok": True}
 
     @app.get("/api/health")
     def health():
@@ -108,24 +200,41 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
             "extractor": extractor.name,
             "model": settings.model if extractor.name != "none" else None,
             "confidence_threshold": settings.confidence_threshold,
-            "auth_required": bool(settings.token),
+            "auth_required": auth_mode() != "open",
+            "mode": auth_mode(),
+            "mail_inbox": (settings.mail_address or settings.imap_user) if settings.mail_enabled else None,
         }
 
     # ---- receipts
 
     @app.post("/api/receipts", dependencies=[api])
-    async def upload(files: list[UploadFile] = File(...), conn: sqlite3.Connection = Depends(get_conn)):
+    async def upload(files: list[UploadFile] = File(...), combine: bool = False,
+                     conn: sqlite3.Connection = Depends(get_conn)):
+        """Accept files. Each becomes a transaction in status 'processing' and is read in the background.
+
+        combine=1 joins several photos into one receipt (the pages of a long bill).
+        """
+        loaded: list[tuple[str, bytes]] = []
         results = []
         for f in files:
             data = await f.read(settings.max_upload_bytes + 1)
             if len(data) > settings.max_upload_bytes:
                 results.append({"filename": f.filename, "error": "File is larger than 15 MB"})
-                continue
+            else:
+                loaded.append((f.filename or "upload", data))
+        if combine and len(loaded) > 1:
             try:
-                txns = service.ingest_file(conn, settings, vault, extractor, data, f.filename or "upload")
-                results.append({"filename": f.filename, "transactions": txns})
+                loaded = [(f"{len(loaded)}-page receipt.jpg", service.stitch_images([d for _, d in loaded]))]
             except ValueError as exc:
-                results.append({"filename": f.filename, "error": str(exc)})
+                return {"results": results + [{"filename": "pages", "error": str(exc)}]}
+        for name, data in loaded:
+            try:
+                txns = service.ingest_file(conn, settings, vault, extractor, data, name,
+                                           defer=not settings.sync_ingest)
+                results.append({"filename": name, "transactions": txns})
+            except ValueError as exc:
+                results.append({"filename": name, "error": str(exc)})
+        worker.wake()
         return {"results": results}
 
     @app.post("/api/transactions", dependencies=[api], status_code=201)

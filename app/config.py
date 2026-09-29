@@ -19,12 +19,41 @@ class Settings:
     pdf_mode: str = field(default_factory=lambda: os.environ.get("RT_PDF_MODE", "auto"))  # auto | images | file
     json_mode: bool = field(default_factory=lambda: os.environ.get("RT_JSON_MODE", "1") != "0")
     fernet_key: str = field(default_factory=lambda: os.environ.get("RT_KEY", ""))
-    token: str = field(default_factory=lambda: os.environ.get("RT_TOKEN", ""))
+    token: str = field(default_factory=lambda: os.environ.get("RT_TOKEN", ""))  # long-lived API token for scripts and Shortcuts
+    password_hash: str = field(default_factory=lambda: os.environ.get("RT_PASSWORD_HASH", ""))  # browser login (python -m app.auth)
+    require_auth: bool = field(default_factory=lambda: os.environ.get("RT_REQUIRE_AUTH", "0") == "1")  # refuse to start with no login (set in docker-compose)
+    session_days: int = field(default_factory=lambda: int(os.environ.get("RT_SESSION_DAYS", "30")))
+    sync_ingest: bool = field(default_factory=lambda: os.environ.get("RT_SYNC_INGEST", "0") == "1")  # read receipts inside the upload request (tests)
     confidence_threshold: float = field(
         default_factory=lambda: float(os.environ.get("RT_CONFIDENCE_THRESHOLD", "0.8"))
     )
+    # Email intake: a dedicated mailbox that the app checks over IMAP. Disabled unless host, user, password
+    # and at least one allowed sender are set.
+    imap_host: str = field(default_factory=lambda: os.environ.get("RT_IMAP_HOST", ""))
+    imap_port: int = field(default_factory=lambda: int(os.environ.get("RT_IMAP_PORT", "993")))
+    imap_user: str = field(default_factory=lambda: os.environ.get("RT_IMAP_USER", ""))
+    imap_password: str = field(default_factory=lambda: os.environ.get("RT_IMAP_PASSWORD", ""))
+    imap_folder: str = field(default_factory=lambda: os.environ.get("RT_IMAP_FOLDER", "INBOX"))
+    imap_done_folder: str = field(default_factory=lambda: os.environ.get("RT_IMAP_DONE_FOLDER", "Processed"))
+    imap_reject_folder: str = field(default_factory=lambda: os.environ.get("RT_IMAP_REJECT_FOLDER", "Rejected"))
+    mail_allowed_senders: str = field(default_factory=lambda: os.environ.get("RT_MAIL_ALLOWED_SENDERS", ""))
+    mail_require_auth: bool = field(default_factory=lambda: os.environ.get("RT_MAIL_REQUIRE_AUTH", "1") != "0")
+    mail_poll_seconds: int = field(default_factory=lambda: int(os.environ.get("RT_MAIL_POLL_SECONDS", "120")))
+    mail_address: str = field(default_factory=lambda: os.environ.get("RT_MAIL_ADDRESS", ""))  # shown in the app; defaults to the IMAP user
+    ntfy_url: str = field(default_factory=lambda: os.environ.get("RT_NTFY_URL", ""))  # e.g. https://ntfy.sh/<long-random-topic>
+    ntfy_token: str = field(default_factory=lambda: os.environ.get("RT_NTFY_TOKEN", ""))
+    ntfy_details: bool = field(default_factory=lambda: os.environ.get("RT_NTFY_DETAILS", "0") == "1")
+    public_url: str = field(default_factory=lambda: os.environ.get("RT_PUBLIC_URL", ""))
     max_upload_bytes: int = 15 * 1024 * 1024
     few_shot_corrections: int = 20
+
+    @property
+    def allowed_senders(self) -> set[str]:
+        return {a.strip().lower() for a in self.mail_allowed_senders.split(",") if a.strip()}
+
+    @property
+    def mail_enabled(self) -> bool:
+        return bool(self.imap_host and self.imap_user and self.imap_password and self.allowed_senders)
 
     @property
     def db_path(self) -> Path:

@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Receipt tracker</title>
+<title>Receipts</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#1f6f5c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Receipts">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <style>
   :root {
     --bg:#f6f5f2; --card:#fff; --ink:#1d1d1b; --muted:#6b6a66; --line:#e3e1db;
@@ -36,7 +41,7 @@
   input[type=checkbox] { width:auto; }
   label.f { display:block; font-size:13px; color:var(--muted); }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
-  .drop { border:2px dashed var(--line); border-radius:12px; padding:28px; text-align:center; }
+  .drop { border:2px dashed var(--line); border-radius:12px; padding:28px; text-align:center; margin-bottom:12px; }
   .drop.over { border-color:var(--accent); background:var(--card); }
   .flag { display:inline-block; background:var(--warn-bg); color:var(--warn); border-radius:6px; padding:1px 8px; font-size:12px; margin:2px 4px 2px 0; }
   .ok { color:var(--good); } .err { color:var(--bad); }
@@ -56,12 +61,26 @@
   .preview pre { white-space:pre-wrap; padding:10px; margin:0; font-size:12px; }
   #toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:10px 16px; border-radius:10px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:92vw; z-index:20; }
   #toast.show { opacity:1; }
+  header { padding-top:env(safe-area-inset-top); }
+  .snap { display:block; width:100%; padding:22px; font:inherit; font-size:18px; font-weight:700; border:0; border-radius:14px; background:var(--accent); color:var(--accent-ink); cursor:pointer; margin-bottom:12px; }
+  .thumbs { display:flex; gap:8px; overflow-x:auto; margin-top:8px; }
+  .thumb { position:relative; flex:0 0 auto; }
+  .thumb img { height:110px; border-radius:8px; border:1px solid var(--line); display:block; }
+  .thumb .x { position:absolute; top:3px; right:3px; border:0; border-radius:50%; width:26px; height:26px; background:rgba(0,0,0,.65); color:#fff; font-size:16px; line-height:1; cursor:pointer; }
+  .login { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; padding:16px; z-index:50; }
+  .login .card { width:min(360px,100%); }
+  .linkbtn { border:0; background:none; color:var(--muted); font:inherit; font-size:13px; cursor:pointer; text-decoration:underline; padding:0 0 0 10px; }
+  @media (max-width:600px) {
+    button.btn, label.btn { padding:11px 16px; }
+    input, select, textarea { font-size:16px; }
+    main { padding-bottom:calc(80px + env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
 <header>
   <div class="wrap">
-    <div class="top"><h1>Receipt tracker</h1><span class="muted" id="engine"></span></div>
+    <div class="top"><h1>Receipt tracker</h1><span class="muted"><span id="engine"></span><button class="linkbtn" id="signout" hidden>Sign out</button></span></div>
     <nav id="nav"></nav>
   </div>
 </header>
@@ -111,12 +130,33 @@ const flagText = (f) => f.startsWith("low_confidence:") ? "Unsure about " + f.sp
 
 // ---------- API
 let token = localStorage.getItem("rt_token") || "";
+const CSRF = { "x-requested-with": "receipt-tracker" };
+let loginPromise = null;
+function needLogin() {
+  if (loginPromise) return loginPromise;
+  loginPromise = new Promise((resolve) => {
+    const pw = h("input", { type: "password", placeholder: "Password", autocomplete: "current-password" });
+    const msg = h("p", { class: "err" });
+    const overlay = h("div", { class: "login" });
+    const submit = async () => {
+      const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json", ...CSRF }, body: JSON.stringify({ password: pw.value }) });
+      if (r.ok) { loginPromise = null; overlay.remove(); resolve(); return; }
+      msg.textContent = (await r.json().catch(() => ({}))).detail || "Sign-in failed"; pw.select();
+    };
+    pw.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    overlay.append(h("div", { class: "card" }, h("h2", { text: "Sign in", style: "margin-top:0" }), pw, msg, h("button", { class: "btn primary", onclick: submit }, "Sign in")));
+    document.body.append(overlay); pw.focus();
+  });
+  return loginPromise;
+}
 async function api(path, opts = {}) {
-  const headers = { ...(opts.headers || {}) };
+  const headers = { ...CSRF, ...(opts.headers || {}) };
   if (token) headers["x-token"] = token;
   if (opts.json !== undefined) { headers["content-type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
   const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) {
+    const sess = await fetch("/api/session").then((r) => r.json()).catch(() => ({}));
+    if (sess.mode === "password") { await needLogin(); return api(path, opts); }
     const t = prompt("Access token");
     if (t) { token = t; localStorage.setItem("rt_token", t); return api(path, opts); }
     throw new Error("Access token required");
@@ -140,21 +180,94 @@ async function download(path, name) {
 }
 
 // ---------- state
-const S = { tab: "add", cats: [], month: thisMonth(), pending: 0, engine: null };
+const S = { tab: "add", cats: [], month: thisMonth(), pending: 0, processing: 0, engine: null, recentIds: [], renderRecent: null, afterFlush: null, outbox: 0 };
 const TABS = [["add", "Add"], ["review", "Review"], ["txns", "Transactions"], ["summary", "Summary"], ["settings", "Settings"]];
 
 async function refreshMeta() {
   S.cats = await api("/api/categories");
   S.pending = (await api("/api/transactions?status=needs_review")).length;
+  S.processing = (await api("/api/transactions?status=processing")).length;
   if (!S.engine) S.engine = await api("/api/config");
-  $("#engine").textContent = S.engine.extractor !== "none" ? "AI: " + S.engine.model : "AI off: manual entry only";
+  $("#engine").textContent = S.processing ? `Reading ${S.processing}…` : S.engine.extractor !== "none" ? "AI: " + S.engine.model : "AI off: manual entry only";
+  $("#signout").hidden = S.engine.mode !== "password";
 }
 function renderNav() {
   $("#nav").replaceChildren(...TABS.map(([id, label]) =>
     h("button", { class: S.tab === id ? "on" : "", onclick: () => go(id) }, label,
       id === "review" && S.pending ? h("span", { class: "badge", text: S.pending }) : null)));
 }
-async function go(tab) { S.tab = tab; await refreshMeta().catch(() => {}); renderNav(); await guard(VIEWS[tab])(); }
+async function go(tab) { S.tab = tab; S.renderRecent = null; S.afterFlush = null; await refreshMeta().catch(() => {}); renderNav(); await guard(VIEWS[tab])(); schedulePoll(); }
+
+// While receipts are being read in the background, refresh quietly until they settle.
+let pollTimer = null;
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (!S.processing) return;
+  pollTimer = setTimeout(async () => {
+    const before = S.pending;
+    try {
+      await refreshMeta(); renderNav();
+      if (S.tab === "add" && S.renderRecent) await S.renderRecent();
+      if (S.tab === "review" && S.pending !== before) await guard(VIEWS.review)();
+    } catch (_) {}
+    schedulePoll();
+  }, 3000);
+}
+
+// ---------- offline outbox: photos taken without signal wait in this browser and are sent later
+const idb = (() => {
+  const open = () => new Promise((res, rej) => { const r = indexedDB.open("rt", 1); r.onupgradeneeded = () => r.result.createObjectStore("outbox", { keyPath: "id", autoIncrement: true }); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const tx = async (mode, fn) => { const db = await open(); return new Promise((res, rej) => { const t = db.transaction("outbox", mode); const out = fn(t.objectStore("outbox")); t.oncomplete = () => res(out.result); t.onerror = () => rej(t.error); }); };
+  return { add: (i) => tx("readwrite", (s) => s.add(i)), all: () => tx("readonly", (s) => s.getAll()), del: (id) => tx("readwrite", (s) => s.delete(id)) };
+})();
+async function sendFiles(files, combine) {
+  const fd = new FormData(); for (const f of files) fd.append("files", f);
+  try {
+    return (await api("/api/receipts" + (combine ? "?combine=true" : ""), { method: "POST", body: fd })).results;
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;      // fetch throws TypeError when there is no network
+    try { await idb.add({ files: files.map((f) => ({ name: f.name, type: f.type, blob: f })), combine }); S.outbox = (await idb.all()).length; toast("No signal: saved on this phone and will be sent when you are back online"); return null; }
+    catch (_) { throw new Error("No connection, and this browser could not save the photo for later."); }
+  }
+}
+// Send files, remember the new records so they show up as "Reading…", and return any per-file errors.
+async function submit(files, combine = false) {
+  if (!files.length) return [];
+  const out = await sendFiles(files, combine);
+  if (!out) return [];
+  for (const r of out) for (const t of r.transactions || []) S.recentIds.unshift(t.id);
+  S.recentIds = S.recentIds.slice(0, 20);
+  await refreshMeta(); renderNav(); schedulePoll();
+  return out.filter((r) => r.error).map((r) => `${r.filename}: ${r.error}`);
+}
+let flushing = null;   // the browser can fire 'online' twice; never send the same queued item twice
+function flushOutbox() { return flushing || (flushing = _flushOutbox().finally(() => { flushing = null; })); }
+async function _flushOutbox() {
+  let items = []; try { items = await idb.all(); } catch (_) {}
+  S.outbox = items.length; let sent = 0;
+  for (const it of items) {
+    const files = it.files.map((f) => new File([f.blob], f.name, { type: f.type }));
+    const fd = new FormData(); for (const f of files) fd.append("files", f);
+    try { const res = await api("/api/receipts" + (it.combine ? "?combine=true" : ""), { method: "POST", body: fd }); for (const r of res.results) for (const t of r.transactions || []) S.recentIds.unshift(t.id); await idb.del(it.id); sent++; }
+    catch (e) { if (e instanceof TypeError) break; throw e; }
+  }
+  try { S.outbox = (await idb.all()).length; } catch (_) {}
+  if (sent) { toast(`Sent ${sent} receipt(s) that were waiting on this phone`); await refreshMeta(); renderNav(); schedulePoll(); }
+  if (S.afterFlush) await S.afterFlush();
+}
+// Android "Share to Receipts": the service worker parks the shared files in a cache; pick them up here.
+async function takeShared() {
+  if (!new URLSearchParams(location.search).has("shared") || !window.caches) return;
+  history.replaceState(null, "", "/");
+  const cache = await caches.open("share-target"); const files = [];
+  for (const req of await cache.keys()) {
+    const res = await cache.match(req);
+    files.push(new File([await res.blob()], decodeURIComponent(res.headers.get("x-name") || "shared"), { type: res.headers.get("content-type") || "" }));
+    await cache.delete(req);
+  }
+  const errs = await submit(files); errs.forEach((e) => toast(e, true));
+  if (files.length) toast(`Received ${files.length} shared file(s)`);
+}
 
 const catSelect = (value, blank = "Uncategorised") =>
   h("select", { value: value ?? "" }, h("option", { value: "" }, blank),
@@ -225,26 +338,46 @@ async function openEditor(id, onDone) {
 // ---------- views
 const VIEWS = {
   async add() {
-    const results = h("div");
-    const input = h("input", { type: "file", multiple: true, accept: "image/*,application/pdf,.eml", hidden: true });
-    const send = guard(async (files) => {
-      if (!files.length) return;
-      const fd = new FormData(); for (const f of files) fd.append("files", f);
-      results.replaceChildren(h("p", { class: "muted", text: `Reading ${files.length} file(s)…` }));
-      const { results: out } = await api("/api/receipts", { method: "POST", body: fd });
-      results.replaceChildren(...out.map((r) => r.error
-        ? h("div", { class: "card err", text: `${r.filename}: ${r.error}` })
-        : r.transactions.map((t) => h("div", { class: "card row", onclick: () => openEditor(t.id, () => go("add")), style: "cursor:pointer" },
-            h("div", { class: "grow" }, h("div", { text: t.merchant || "(could not read merchant)" }), h("div", { class: "muted", text: `${t.date || "no date"} · ${t.category || "Uncategorised"}` }), flagList(t)),
-            h("div", { class: "amt", text: t.amount_paise === null ? "?" : inr(t.amount_paise) }),
-            h("span", { class: t.status === "accepted" ? "ok" : "err", text: t.status === "accepted" ? "Filed" : "Needs review" })))));
-      await refreshMeta(); renderNav();
+    const results = h("div"), errBox = h("div"), pagesBox = h("div"), outboxBox = h("div");
+    let pages = [];   // photos taken so far for the receipt in progress
+
+    const recentCard = (t) => t.status === "processing"
+      ? h("div", { class: "card row" }, h("div", { class: "grow" }, h("div", { text: t.receipt_name || "Receipt" }), h("div", { class: "muted", text: "Reading… you can leave this screen" })), h("span", { class: "muted", text: "…" }))
+      : h("div", { class: "card row", onclick: () => openEditor(t.id, () => go("add")), style: "cursor:pointer" },
+          h("div", { class: "grow" }, h("div", { text: t.merchant || "(could not read merchant)" }), h("div", { class: "muted", text: `${t.date || "no date"} · ${t.category || "Uncategorised"}` }), flagList(t)),
+          h("div", { class: "amt", text: t.amount_paise === null ? "?" : inr(t.amount_paise) }),
+          h("span", { class: t.status === "accepted" ? "ok" : "err", text: t.status === "accepted" ? "Filed" : "Needs review" }));
+    const showRecent = async () => {
+      const list = await Promise.all(S.recentIds.map((id) => api("/api/transactions/" + id).catch(() => null)));
+      results.replaceChildren(...list.filter(Boolean).map(recentCard));
+    };
+    S.renderRecent = showRecent;
+    S.afterFlush = async () => { showOutbox(); await showRecent(); };
+    const showOutbox = () => outboxBox.replaceChildren(S.outbox ? h("div", { class: "card row" }, h("span", { class: "grow", text: `${S.outbox} receipt(s) waiting to send (no signal earlier)` }), h("button", { class: "btn", onclick: guard(async () => { await flushOutbox(); showOutbox(); await showRecent(); }) }, "Send now")) : null);
+    const send = guard(async (files, combine = false) => {
+      const errs = await submit(files, combine);
+      errBox.replaceChildren(...errs.map((e) => h("div", { class: "card err", text: e })));
+      showOutbox(); await showRecent();
     });
-    input.addEventListener("change", () => send([...input.files]));
+
+    const camera = h("input", { type: "file", accept: "image/*", capture: "environment", hidden: true });
+    camera.addEventListener("change", () => { pages.push(...camera.files); camera.value = ""; renderPages(); });
+    const renderPages = () => pagesBox.replaceChildren(pages.length ? h("div", { class: "card" },
+      h("b", { text: pages.length === 1 ? "1 photo ready" : `${pages.length} pages of one receipt` }),
+      h("div", { class: "thumbs" }, ...pages.map((f, i) => h("div", { class: "thumb" },
+        h("img", { src: URL.createObjectURL(f), alt: `Page ${i + 1}` }),
+        h("button", { class: "x", "aria-label": "Remove page", onclick: () => { pages.splice(i, 1); renderPages(); } }, "×")))),
+      h("div", { class: "row", style: "margin-top:10px" },
+        h("button", { class: "btn primary", onclick: async () => { const p = pages; pages = []; renderPages(); await send(p, true); } }, pages.length === 1 ? "Send" : "Send as one receipt"),
+        h("button", { class: "btn", onclick: () => camera.click() }, "Add another page"),
+        h("button", { class: "btn", onclick: () => { pages = []; renderPages(); } }, "Discard"))) : null);
+
+    const input = h("input", { type: "file", multiple: true, accept: "image/*,application/pdf,.eml", hidden: true });
+    input.addEventListener("change", () => { send([...input.files]); input.value = ""; });
     const drop = h("div", { class: "drop" },
-      h("p", {}, h("b", { text: "Add receipts and invoices" })),
-      h("p", { class: "muted", text: "Photos, PDFs, or forwarded emails (.eml). Drop them here or choose files." }),
-      h("label", { class: "btn primary" }, "Choose files or take a photo", input));
+      h("p", {}, h("b", { text: "Or add files" })),
+      h("p", { class: "muted", text: "Photos from your gallery, PDFs, or forwarded emails (.eml). Each file is its own receipt." + (S.engine.mail_inbox ? ` You can also email them to ${S.engine.mail_inbox}.` : "") }),
+      h("button", { class: "btn", onclick: () => input.click() }, "Choose files"));
     drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
     drop.addEventListener("dragleave", () => drop.classList.remove("over"));
     drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); send([...e.dataTransfer.files]); });
@@ -254,11 +387,14 @@ const VIEWS = {
       await api("/api/transactions", { method: "POST", json: { merchant: m.merchant.value, amount: m.amount.value, date: m.date.value, category_id: m.cat.value ? Number(m.cat.value) : null, payment_method: "cash" } });
       toast("Added"); m.merchant.value = ""; m.amount.value = ""; await refreshMeta(); renderNav();
     });
-    $("#view").replaceChildren(drop, S.engine.extractor === "none" ? h("p", { class: "card muted", text: "AI reading is off (no model configured), so every upload goes to Review for manual entry." }) : null,
-      results,
+    $("#view").replaceChildren(
+      h("button", { class: "snap", onclick: () => camera.click() }, "Snap a receipt"), camera, input, pagesBox,
+      S.engine.extractor === "none" ? h("p", { class: "card muted", text: "AI reading is off (no model configured), so every upload goes to Review for manual entry." }) : null,
+      outboxBox, errBox, results, drop,
       h("div", { class: "card" }, h("b", { text: "Cash or no receipt" }),
         h("div", { class: "grid", style: "margin-top:8px" }, m.merchant, m.amount, m.date, m.cat),
         h("div", { style: "margin-top:10px" }, h("button", { class: "btn", onclick: addManual }, "Add entry"))));
+    showOutbox(); await showRecent();
   },
 
   async review() {
@@ -329,7 +465,10 @@ const VIEWS = {
   },
 };
 
-go("add");
+$("#signout").addEventListener("click", async () => { await fetch("/api/logout", { method: "POST", headers: CSRF }); location.reload(); });
+window.addEventListener("online", guard(flushOutbox));
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+(async () => { await guard(takeShared)(); await guard(flushOutbox)(); go("add"); })();
 </script>
 </body>
 </html>

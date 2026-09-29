@@ -1,0 +1,32 @@
+# Receipt tracker behind Caddy (automatic HTTPS). Only Caddy is exposed to the internet.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RT_REQUIRE_AUTH: "1"      # never start the internet-facing app without a login
+    volumes:
+      - rt_data:/data
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RT_DOMAIN: ${RT_DOMAIN:?set RT_DOMAIN in .env, for example receipts.abalakrishnan.in}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  rt_data:
+  caddy_data:
+  caddy_config:

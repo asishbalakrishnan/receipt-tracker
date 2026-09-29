@@ -51,7 +51,7 @@ def fake():
 
 @pytest.fixture
 def client(tmp_path, fake):
-    settings = Settings(data_dir=tmp_path, llm_api_key="", token="")
+    settings = Settings(data_dir=tmp_path, llm_api_key="", token="", sync_ingest=True)
     app = create_app(settings, extractor=fake)
     return TestClient(app)
 

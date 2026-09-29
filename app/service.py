@@ -52,6 +52,7 @@ def row_to_txn(row: sqlite3.Row, paths: dict[int, str] | None = None) -> dict:
         d[key] = json.loads(d[key] or ("{}" if key in ("field_origin", "confidence") else "[]"))
     d["has_file"] = bool(d.get("receipt_file"))
     d.pop("receipt_file", None)
+    d.pop("context", None)
     if paths is not None:
         d["category"] = paths.get(d["category_id"]) if d["category_id"] else None
     return d
@@ -96,9 +97,13 @@ def normalise(raw: dict) -> tuple[dict, dict]:
     return rec, conf
 
 
-def ingest_file(conn: sqlite3.Connection, settings: Settings, vault: Vault, extractor: Extractor,
-                data: bytes, filename: str) -> list[dict]:
-    """Store one uploaded file and create one transaction per receipt found in it."""
+def ingest_file(conn: sqlite3.Connection, settings: Settings, vault: Vault, extractor: Extractor | None,
+                data: bytes, filename: str, defer: bool = False) -> list[dict]:
+    """Store one uploaded file and create one transaction per receipt found in it.
+
+    With defer=True the rows are left in status 'processing' for the background worker to read;
+    otherwise each one is read before returning.
+    """
     kind = sniff(data, filename)
     if kind is None:
         raise ValueError("Unsupported file type. Use JPG, PNG, WebP, PDF, or a forwarded .eml file.")
@@ -108,15 +113,48 @@ def ingest_file(conn: sqlite3.Connection, settings: Settings, vault: Vault, extr
         parts = parse_eml(data)
         if not parts:
             raise ValueError("The email has no PDF, image attachment, or readable text.")
-        out = [_ingest_one(conn, settings, vault, extractor, p.data, p.media_type, p.text, "email", p.name)
-               for p in parts]
-        return out
-    return [_ingest_one(conn, settings, vault, extractor, data, media_type, None, source, filename)]
+        items = [(p.data, p.media_type, p.text, "email", p.name) for p in parts]
+    else:
+        items = [(data, media_type, None, source, filename)]
+
+    out = []
+    for payload, mtype, text, src, name in items:
+        txn_id = create_pending(conn, vault, payload, mtype, text, src, name)
+        if not defer:
+            process_txn(conn, settings, vault, extractor, txn_id)
+        out.append(get_txn(conn, txn_id))
+    return out
 
 
-def _ingest_one(conn, settings, vault, extractor, data, media_type, text, source, filename) -> dict:
+def create_pending(conn, vault: Vault, data: bytes | None, media_type: str | None, text: str | None,
+                   source: str, filename: str) -> str:
+    """Encrypt and store the original and insert a row in status 'processing'. Nothing is lost if the model later fails.
+
+    For a text-only email the message text is the stored file. For an attachment, `text` (the email headers)
+    is kept in `context` so the model can use the email date and sender.
+    """
+    text_only = data is None
+    blob = (text or "").encode() if text_only else data
+    ts = now()
+    txn_id = uuid.uuid4().hex[:12]
+    conn.execute(
+        """INSERT INTO transactions (id, currency, kind, payment_method, source, receipt_file, receipt_name,
+            receipt_type, receipt_sha256, context, status, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (txn_id, "INR", "personal", "other", source, vault.save(blob), filename[:200],
+         "text/plain" if text_only else media_type, hashlib.sha256(blob).hexdigest(),
+         None if text_only else text, "processing", ts, ts),
+    )
+    conn.commit()
+    return txn_id
+
+
+def process_txn(conn, settings: Settings, vault: Vault, extractor: Extractor, txn_id: str) -> dict:
+    """Read a stored receipt with the model, apply rules and checks, and settle the row's status."""
+    row = conn.execute("SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
+    if row is None:
+        raise KeyError(txn_id)
     paths = db.category_paths(conn)
-    sha = hashlib.sha256(data if data is not None else (text or "").encode()).hexdigest()
     flags: list[str] = []
     origin: dict[str, str] = {}
     rec = {"merchant": "", "date": None, "amount_paise": None, "currency": "INR", "tax_amount_paise": None,
@@ -125,8 +163,13 @@ def _ingest_one(conn, settings, vault, extractor, data, media_type, text, source
     conf: dict = {}
 
     try:
+        blob = vault.load(row["receipt_file"])
+        if row["receipt_type"] == "text/plain":
+            item = ExtractInput(None, None, blob.decode("utf-8", "replace"))
+        else:
+            item = ExtractInput(blob, row["receipt_type"], row["context"])
         examples = classify.recent_examples(conn, paths, settings.few_shot_corrections)
-        raw = extractor.extract(ExtractInput(data, media_type, text), sorted(paths.values()), examples)
+        raw = extractor.extract(item, sorted(paths.values()), examples)
         rec, conf = normalise(raw)
         for key in ("merchant", "date", "amount_paise", "currency", "tax_amount_paise", "gstin",
                     "payment_method", "kind", "line_items"):
@@ -150,39 +193,59 @@ def _ingest_one(conn, settings, vault, extractor, data, media_type, text, source
         flags.append("category_unknown")
 
     flags += validate(rec, conf, settings.confidence_threshold)
-    flags += _duplicate_flags(conn, rec, sha)
+    flags += _duplicate_flags(conn, rec, row["receipt_sha256"], txn_id)
 
-    txn_id = uuid.uuid4().hex[:12]
-    stored = vault.save(data if data is not None else (text or "").encode())
-    ts = now()
     conn.execute(
-        """INSERT INTO transactions (id, amount_paise, currency, date, merchant, category_id, kind,
-            payment_method, tax_amount_paise, gstin, line_items, source, receipt_file, receipt_name,
-            receipt_type, receipt_sha256, field_origin, confidence, flags, status, notes, tags,
-            created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (txn_id, rec["amount_paise"], rec["currency"], rec["date"], rec["merchant"], category_id, rec["kind"],
-         rec["payment_method"], rec["tax_amount_paise"], rec["gstin"], json.dumps(rec["line_items"]), source,
-         stored, filename[:200], media_type or "text/plain", sha, json.dumps(origin), json.dumps(conf),
-         json.dumps(flags), "needs_review" if flags else "accepted", rec["notes"], "[]", ts, ts),
+        """UPDATE transactions SET amount_paise=?, currency=?, date=?, merchant=?, category_id=?, kind=?,
+            payment_method=?, tax_amount_paise=?, gstin=?, line_items=?, field_origin=?, confidence=?, flags=?,
+            status=?, notes=?, updated_at=? WHERE id=?""",
+        (rec["amount_paise"], rec["currency"], rec["date"], rec["merchant"], category_id, rec["kind"],
+         rec["payment_method"], rec["tax_amount_paise"], rec["gstin"], json.dumps(rec["line_items"]),
+         json.dumps(origin), json.dumps(conf), json.dumps(flags), "needs_review" if flags else "accepted",
+         rec["notes"], now(), txn_id),
     )
     conn.commit()
     return get_txn(conn, txn_id)
 
 
-def _duplicate_flags(conn: sqlite3.Connection, rec: dict, sha: str) -> list[str]:
+def _duplicate_flags(conn: sqlite3.Connection, rec: dict, sha: str, own_id: str) -> list[str]:
     flags = []
-    if conn.execute("SELECT 1 FROM transactions WHERE receipt_sha256 = ? LIMIT 1", (sha,)).fetchone():
+    if conn.execute("SELECT 1 FROM transactions WHERE receipt_sha256 = ? AND id != ? LIMIT 1", (sha, own_id)).fetchone():
         flags.append("duplicate_file")
     if rec.get("amount_paise") and rec.get("date") and rec.get("merchant"):
         key = classify.merchant_key(rec["merchant"])
         rows = conn.execute(
-            "SELECT merchant FROM transactions WHERE date = ? AND amount_paise = ?",
-            (rec["date"], rec["amount_paise"]),
+            "SELECT merchant FROM transactions WHERE date = ? AND amount_paise = ? AND id != ?",
+            (rec["date"], rec["amount_paise"], own_id),
         ).fetchall()
         if any(classify.merchant_key(r["merchant"]) == key for r in rows):
             flags.append("possible_duplicate")
     return flags
+
+
+def stitch_images(pages: list[bytes], max_height: int = 8000) -> bytes:
+    """Join several photos of one long receipt into a single tall JPEG, top to bottom."""
+    from PIL import Image, ImageOps
+
+    imgs = []
+    for data in pages:
+        try:
+            imgs.append(ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB"))
+        except Exception:
+            raise ValueError("One of the pages is not a readable image.")
+    width = min(max(i.width for i in imgs), 1600)
+    imgs = [i.resize((width, round(i.height * width / i.width))) for i in imgs]
+    height = sum(i.height for i in imgs)
+    canvas = Image.new("RGB", (width, height), "white")
+    y = 0
+    for i in imgs:
+        canvas.paste(i, (0, y))
+        y += i.height
+    if height > max_height:
+        canvas = canvas.resize((round(width * max_height / height), max_height))
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=85)
+    return out.getvalue()
 
 
 # ------------------------------------------------------------------ manual entry and edits

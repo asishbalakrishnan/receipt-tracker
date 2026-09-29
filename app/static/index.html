@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipt tracker</title>
+<style>
+  :root {
+    --bg:#f6f5f2; --card:#fff; --ink:#1d1d1b; --muted:#6b6a66; --line:#e3e1db;
+    --accent:#1f6f5c; --accent-ink:#fff; --warn:#a15c00; --warn-bg:#fff3dc; --bad:#b3261e; --good:#1f6f5c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151514; --card:#1f1f1d; --ink:#ecebe6; --muted:#a3a29c; --line:#33332f;
+      --accent:#4db89e; --accent-ink:#0b1f19; --warn:#f0b35a; --warn-bg:#3a2d12; --bad:#f2867e; --good:#4db89e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line); }
+  .wrap { max-width:960px; margin:0 auto; padding:0 16px; }
+  .top { display:flex; align-items:center; justify-content:space-between; padding:12px 0 6px; }
+  h1 { font-size:18px; margin:0; }
+  nav { display:flex; gap:4px; overflow-x:auto; padding-bottom:8px; }
+  nav button { flex:0 0 auto; border:0; background:transparent; color:var(--muted); padding:8px 12px; border-radius:8px; font:inherit; cursor:pointer; }
+  nav button.on { background:var(--card); color:var(--ink); box-shadow:0 0 0 1px var(--line); font-weight:600; }
+  .badge { background:var(--warn); color:#fff; border-radius:10px; padding:0 7px; margin-left:6px; font-size:12px; }
+  main { padding:16px 0 80px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1 1 auto; }
+  .muted { color:var(--muted); font-size:13px; }
+  .amt { font-variant-numeric:tabular-nums; font-weight:600; }
+  button.btn, label.btn { display:inline-block; border:1px solid var(--line); background:var(--card); color:var(--ink); padding:8px 14px; border-radius:8px; font:inherit; cursor:pointer; }
+  button.primary, label.primary { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); font-weight:600; }
+  button.danger { color:var(--bad); }
+  input, select, textarea { font:inherit; color:var(--ink); background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; width:100%; }
+  input[type=checkbox] { width:auto; }
+  label.f { display:block; font-size:13px; color:var(--muted); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .drop { border:2px dashed var(--line); border-radius:12px; padding:28px; text-align:center; }
+  .drop.over { border-color:var(--accent); background:var(--card); }
+  .flag { display:inline-block; background:var(--warn-bg); color:var(--warn); border-radius:6px; padding:1px 8px; font-size:12px; margin:2px 4px 2px 0; }
+  .ok { color:var(--good); } .err { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  td.r, th.r { text-align:right; }
+  tr.click { cursor:pointer; } tr.click:hover { background:var(--bg); }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:4px; }
+  .bar > i { display:block; height:100%; background:var(--accent); }
+  dialog { border:1px solid var(--line); border-radius:14px; background:var(--bg); color:var(--ink); width:min(880px,96vw); max-height:94vh; padding:0; }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  .dlg { display:grid; grid-template-columns:1fr; gap:14px; padding:16px; }
+  @media (min-width:760px) { .dlg { grid-template-columns:1fr 1fr; } }
+  .preview { background:var(--card); border:1px solid var(--line); border-radius:10px; min-height:200px; max-height:70vh; overflow:auto; display:flex; align-items:flex-start; justify-content:center; }
+  .preview img { max-width:100%; } .preview iframe { width:100%; height:65vh; border:0; }
+  .preview pre { white-space:pre-wrap; padding:10px; margin:0; font-size:12px; }
+  #toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:10px 16px; border-radius:10px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:92vw; z-index:20; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="top"><h1>Receipt tracker</h1><span class="muted" id="engine"></span></div>
+    <nav id="nav"></nav>
+  </div>
+</header>
+<main class="wrap" id="view"></main>
+<dialog id="dlg"></dialog>
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+// ---------- tiny DOM helper: everything is built with textContent, never innerHTML (receipt text is untrusted)
+// replaceChildren would print null/false as text; skip them so optional children can be written inline.
+const _replaceChildren = Element.prototype.replaceChildren;
+Element.prototype.replaceChildren = function (...kids) { return _replaceChildren.apply(this, kids.filter((k) => k !== null && k !== undefined && k !== false)); };
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "text") el.textContent = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k in el && k !== "list") el[k] = v;
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+const $ = (s) => document.querySelector(s);
+
+const inr = (p) => {
+  if (p === null || p === undefined) return "";
+  const neg = p < 0, abs = Math.abs(p), r = Math.floor(abs / 100), ps = String(abs % 100).padStart(2, "0");
+  let s = String(r);
+  if (s.length > 3) { const tail = s.slice(-3); let head = s.slice(0, -3); const parts = []; while (head.length > 2) { parts.unshift(head.slice(-2)); head = head.slice(0, -2); } if (head) parts.unshift(head); s = [...parts, tail].join(","); }
+  return (neg ? "-" : "") + "₹" + s + "." + ps;
+};
+const rupees = (p) => (p === null || p === undefined ? "" : (p / 100).toFixed(2));
+const thisMonth = () => new Date().toISOString().slice(0, 7);
+const FLAG_TEXT = {
+  merchant_missing: "Merchant missing", total_missing: "Total missing", total_not_positive: "Total is not positive",
+  date_missing: "Date missing", date_unreadable: "Date unreadable", date_in_future: "Date is in the future",
+  date_over_5_years_old: "Date is over 5 years old", non_inr_currency: "Not in rupees", gstin_invalid: "GSTIN looks invalid",
+  line_items_mismatch: "Line items do not add up to the total", tax_exceeds_total: "Tax is more than the total",
+  category_unknown: "Category not recognised", duplicate_file: "Same file uploaded before", possible_duplicate: "Possible duplicate",
+};
+const flagText = (f) => f.startsWith("low_confidence:") ? "Unsure about " + f.split(":")[1]
+  : f.startsWith("extraction_failed") ? "AI reading failed: " + f.slice(18) : (FLAG_TEXT[f] || f);
+
+// ---------- API
+let token = localStorage.getItem("rt_token") || "";
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (token) headers["x-token"] = token;
+  if (opts.json !== undefined) { headers["content-type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401) {
+    const t = prompt("Access token");
+    if (t) { token = t; localStorage.setItem("rt_token", t); return api(path, opts); }
+    throw new Error("Access token required");
+  }
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { const j = await res.json(); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : (res.headers.get("content-type") || "").includes("json") ? res.json() : res;
+}
+let toastTimer;
+function toast(msg, bad) {
+  const t = $("#toast"); t.textContent = msg; t.style.background = bad ? "var(--bad)" : ""; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
+}
+const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message, true); } };
+async function download(path, name) {
+  const res = await api(path); const blob = await res.blob();
+  const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
+}
+
+// ---------- state
+const S = { tab: "add", cats: [], month: thisMonth(), pending: 0, engine: null };
+const TABS = [["add", "Add"], ["review", "Review"], ["txns", "Transactions"], ["summary", "Summary"], ["settings", "Settings"]];
+
+async function refreshMeta() {
+  S.cats = await api("/api/categories");
+  S.pending = (await api("/api/transactions?status=needs_review")).length;
+  if (!S.engine) S.engine = await api("/api/config");
+  $("#engine").textContent = S.engine.extractor !== "none" ? "AI: " + S.engine.model : "AI off: manual entry only";
+}
+function renderNav() {
+  $("#nav").replaceChildren(...TABS.map(([id, label]) =>
+    h("button", { class: S.tab === id ? "on" : "", onclick: () => go(id) }, label,
+      id === "review" && S.pending ? h("span", { class: "badge", text: S.pending }) : null)));
+}
+async function go(tab) { S.tab = tab; await refreshMeta().catch(() => {}); renderNav(); await guard(VIEWS[tab])(); }
+
+const catSelect = (value, blank = "Uncategorised") =>
+  h("select", { value: value ?? "" }, h("option", { value: "" }, blank),
+    ...S.cats.map((c) => h("option", { value: c.id, selected: c.id === value }, c.path)));
+
+// ---------- transaction row and editor
+function flagList(t) { return t.flags.map((f) => h("span", { class: "flag", text: flagText(f) })); }
+
+function txnRow(t, onDone) {
+  return h("tr", { class: "click", onclick: () => openEditor(t.id, onDone) },
+    h("td", {}, t.date || "no date"),
+    h("td", {}, h("div", { text: t.merchant || "(no merchant)" }), h("div", { class: "muted", text: t.category || "Uncategorised" }), flagList(t)),
+    h("td", { class: "r amt", text: t.currency === "INR" ? inr(t.amount_paise) : (t.amount_paise / 100).toFixed(2) + " " + t.currency }));
+}
+
+async function openEditor(id, onDone) {
+  const t = await api("/api/transactions/" + id);
+  const dlg = $("#dlg");
+  const f = {
+    merchant: h("input", { value: t.merchant || "" }),
+    date: h("input", { type: "date", value: t.date || "" }),
+    amount: h("input", { inputMode: "decimal", value: rupees(t.amount_paise) }),
+    tax: h("input", { inputMode: "decimal", value: rupees(t.tax_amount_paise) }),
+    gstin: h("input", { value: t.gstin || "" }),
+    category: catSelect(t.category_id),
+    kind: h("select", {}, ...["personal", "business"].map((k) => h("option", { value: k, selected: k === t.kind }, k))),
+    pay: h("select", {}, ...["upi", "card", "cash", "other"].map((k) => h("option", { value: k, selected: k === t.payment_method }, k))),
+    notes: h("textarea", { rows: 2, value: t.notes || "" }),
+    rule: h("input", { type: "checkbox" }),
+  };
+  const preview = h("div", { class: "preview" }, h("span", { class: "muted", text: t.has_file ? "Loading original…" : "No original file (manual entry)" }));
+  if (t.has_file) {
+    api(`/api/transactions/${id}/file`).then((r) => r.blob()).then(async (blob) => {
+      const url = URL.createObjectURL(blob);
+      if (blob.type.startsWith("image/")) preview.replaceChildren(h("img", { src: url, alt: "Original receipt" }));
+      else if (blob.type === "application/pdf") preview.replaceChildren(h("iframe", { src: url, title: "Original PDF", sandbox: "" }));
+      else preview.replaceChildren(h("pre", { text: (await blob.text()).slice(0, 6000) }));
+    }).catch((e) => preview.replaceChildren(h("span", { class: "err", text: e.message })));
+  }
+  const field = (label, el) => h("label", { class: "f" }, label, el);
+  const close = () => { dlg.close(); if (onDone) onDone(); refreshMeta().then(renderNav); };
+  const save = guard(async () => {
+    await api("/api/transactions/" + id, { method: "PATCH", json: {
+      merchant: f.merchant.value, date: f.date.value || null, amount: f.amount.value || null, tax: f.tax.value || null,
+      gstin: f.gstin.value || null, category_id: f.category.value ? Number(f.category.value) : null,
+      kind: f.kind.value, payment_method: f.pay.value, notes: f.notes.value, make_rule: f.rule.checked } });
+    toast("Saved"); close();
+  });
+  const items = t.line_items.length ? h("table", {}, ...t.line_items.map((li) =>
+    h("tr", {}, h("td", { text: li.description }), h("td", { class: "r amt", text: inr(li.amount_paise) })))) : null;
+  dlg.replaceChildren(h("div", { class: "dlg" },
+    h("div", {}, preview, h("div", { class: "muted", text: `${t.source} · ${t.receipt_name || ""}` })),
+    h("div", {},
+      t.flags.length ? h("div", { class: "card" }, h("b", { text: "Please check" }), h("div", {}, flagList(t))) : null,
+      h("div", { class: "grid" }, field("Merchant", f.merchant), field("Date", f.date), field("Total (₹)", f.amount),
+        field("GST (₹)", f.tax), field("GSTIN", f.gstin), field("Category", f.category), field("Kind", f.kind), field("Paid by", f.pay)),
+      field("Notes", f.notes),
+      h("label", { class: "row muted" }, f.rule, "Always use this category and kind for this merchant"),
+      items ? h("div", { class: "card" }, h("b", { text: "Line items" }), items) : null,
+      h("div", { class: "row", style: "margin-top:12px" },
+        h("button", { class: "btn primary", onclick: save }, t.status === "needs_review" ? "Save and approve" : "Save"),
+        t.status === "needs_review" ? h("button", { class: "btn", onclick: guard(async () => { await api(`/api/transactions/${id}/approve`, { method: "POST" }); toast("Approved"); close(); }) }, "Approve as is") : null,
+        h("button", { class: "btn danger", onclick: guard(async () => { if (!confirm("Delete this record and its original file?")) return; await api("/api/transactions/" + id, { method: "DELETE" }); toast("Deleted"); close(); }) }, "Delete"),
+        h("button", { class: "btn", onclick: () => dlg.close() }, "Close")))));
+  dlg.showModal();
+}
+
+// ---------- views
+const VIEWS = {
+  async add() {
+    const results = h("div");
+    const input = h("input", { type: "file", multiple: true, accept: "image/*,application/pdf,.eml", hidden: true });
+    const send = guard(async (files) => {
+      if (!files.length) return;
+      const fd = new FormData(); for (const f of files) fd.append("files", f);
+      results.replaceChildren(h("p", { class: "muted", text: `Reading ${files.length} file(s)…` }));
+      const { results: out } = await api("/api/receipts", { method: "POST", body: fd });
+      results.replaceChildren(...out.map((r) => r.error
+        ? h("div", { class: "card err", text: `${r.filename}: ${r.error}` })
+        : r.transactions.map((t) => h("div", { class: "card row", onclick: () => openEditor(t.id, () => go("add")), style: "cursor:pointer" },
+            h("div", { class: "grow" }, h("div", { text: t.merchant || "(could not read merchant)" }), h("div", { class: "muted", text: `${t.date || "no date"} · ${t.category || "Uncategorised"}` }), flagList(t)),
+            h("div", { class: "amt", text: t.amount_paise === null ? "?" : inr(t.amount_paise) }),
+            h("span", { class: t.status === "accepted" ? "ok" : "err", text: t.status === "accepted" ? "Filed" : "Needs review" })))));
+      await refreshMeta(); renderNav();
+    });
+    input.addEventListener("change", () => send([...input.files]));
+    const drop = h("div", { class: "drop" },
+      h("p", {}, h("b", { text: "Add receipts and invoices" })),
+      h("p", { class: "muted", text: "Photos, PDFs, or forwarded emails (.eml). Drop them here or choose files." }),
+      h("label", { class: "btn primary" }, "Choose files or take a photo", input));
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); send([...e.dataTransfer.files]); });
+    const m = { merchant: h("input", { placeholder: "e.g. Chai stall" }), amount: h("input", { inputMode: "decimal", placeholder: "₹" }),
+      date: h("input", { type: "date", value: new Date().toISOString().slice(0, 10) }), cat: catSelect(null) };
+    const addManual = guard(async () => {
+      await api("/api/transactions", { method: "POST", json: { merchant: m.merchant.value, amount: m.amount.value, date: m.date.value, category_id: m.cat.value ? Number(m.cat.value) : null, payment_method: "cash" } });
+      toast("Added"); m.merchant.value = ""; m.amount.value = ""; await refreshMeta(); renderNav();
+    });
+    $("#view").replaceChildren(drop, S.engine.extractor === "none" ? h("p", { class: "card muted", text: "AI reading is off (no model configured), so every upload goes to Review for manual entry." }) : null,
+      results,
+      h("div", { class: "card" }, h("b", { text: "Cash or no receipt" }),
+        h("div", { class: "grid", style: "margin-top:8px" }, m.merchant, m.amount, m.date, m.cat),
+        h("div", { style: "margin-top:10px" }, h("button", { class: "btn", onclick: addManual }, "Add entry"))));
+  },
+
+  async review() {
+    const list = await api("/api/transactions?status=needs_review");
+    $("#view").replaceChildren(list.length
+      ? h("div", { class: "card" }, h("p", { class: "muted", text: "Tap a record to compare it with the original and fix it. Your corrections teach the classifier." }),
+          h("table", {}, ...list.map((t) => txnRow(t, () => go("review")))))
+      : h("p", { class: "card ok", text: "Nothing to review." }));
+  },
+
+  async txns() {
+    const q = h("input", { type: "search", placeholder: "Search merchant or notes" });
+    const month = h("input", { type: "month", value: S.month });
+    const kind = h("select", {}, ...[["", "All kinds"], ["personal", "Personal"], ["business", "Business"]].map(([v, l]) => h("option", { value: v }, l)));
+    const box = h("div");
+    const load = guard(async () => {
+      S.month = month.value || S.month;
+      const qs = new URLSearchParams({ month: S.month }); if (q.value) qs.set("q", q.value); if (kind.value) qs.set("kind", kind.value);
+      const list = await api("/api/transactions?" + qs);
+      const total = list.filter((t) => t.currency === "INR").reduce((s, t) => s + (t.amount_paise || 0), 0);
+      box.replaceChildren(h("p", { class: "muted", text: `${list.length} records · ${inr(total)}` }),
+        list.length ? h("div", { class: "card" }, h("table", {}, ...list.map((t) => txnRow(t, load)))) : h("p", { class: "card muted", text: "Nothing this month." }));
+    });
+    [q, month, kind].forEach((el) => el.addEventListener("input", load));
+    $("#view").replaceChildren(h("div", { class: "grid" }, month, kind, q), box); await load();
+  },
+
+  async summary() {
+    const month = h("input", { type: "month", value: S.month }); const box = h("div");
+    const load = guard(async () => {
+      S.month = month.value || S.month;
+      const s = await api("/api/summary?month=" + S.month);
+      const delta = s.previous_total_paise ? Math.round(((s.total_paise - s.previous_total_paise) / s.previous_total_paise) * 100) : null;
+      const max = Math.max(1, ...s.by_category.map((c) => c.total_paise));
+      box.replaceChildren(...[
+        h("div", { class: "card" }, h("div", { class: "muted", text: "Total spent" }), h("div", { class: "amt", style: "font-size:28px", text: inr(s.total_paise) }),
+          h("div", { class: "muted", text: `${s.count} records` + (delta === null ? "" : ` · ${delta >= 0 ? "+" : ""}${delta}% vs ${s.previous_month}`) }),
+          h("div", { class: "muted", text: `Personal ${inr(s.by_kind.personal)} · Business ${inr(s.by_kind.business)}` })),
+        s.needs_review_total ? h("p", { class: "flag", text: `${s.needs_review_total} record(s) still need review, so totals may change.` }) : null,
+        h("div", { class: "card" }, h("b", { text: "By category" }),
+          ...(s.by_category.length ? s.by_category.map((c) => h("div", { style: "margin-top:10px" },
+            h("div", { class: "row" }, h("span", { class: "grow", text: c.category }), h("span", { class: "amt", text: inr(c.total_paise) })),
+            h("div", { class: "bar" }, h("i", { style: `width:${Math.round((c.total_paise / max) * 100)}%` })),
+            ...c.children.map((k) => h("div", { class: "row muted", style: "padding-left:12px" }, h("span", { class: "grow", text: k.category }), h("span", { text: inr(k.total_paise) }))))) : [h("p", { class: "muted", text: "No data for this month." })])),
+        s.top_merchants.length ? h("div", { class: "card" }, h("b", { text: "Top merchants" }), h("table", {}, ...s.top_merchants.map((m) => h("tr", {}, h("td", { text: m.merchant }), h("td", { class: "r amt", text: inr(m.total_paise) }))))) : null].filter(Boolean));
+    });
+    month.addEventListener("input", load);
+    $("#view").replaceChildren(h("div", { class: "grid" }, month), box); await load();
+  },
+
+  async settings() {
+    const rules = await api("/api/rules");
+    const catName = h("input", { placeholder: "New category name" }); const parent = catSelect(null, "Top level");
+    parent.replaceChildren(h("option", { value: "" }, "Top level"), ...S.cats.filter((c) => !c.parent_id).map((c) => h("option", { value: c.id }, "Inside " + c.name)));
+    const addCat = guard(async () => { await api("/api/categories", { method: "POST", json: { name: catName.value, parent_id: parent.value ? Number(parent.value) : null } }); toast("Category added"); go("settings"); });
+    const rm = (url, what) => guard(async () => { if (!confirm(`Delete ${what}?`)) return; await api(url, { method: "DELETE" }); go("settings"); });
+    $("#view").replaceChildren(
+      h("div", { class: "card" }, h("b", { text: "Categories" }),
+        h("div", { class: "grid", style: "margin:8px 0" }, catName, parent, h("button", { class: "btn", onclick: addCat }, "Add")),
+        ...S.cats.map((c) => h("div", { class: "row", style: "padding:3px 0" }, h("span", { class: "grow", text: c.path }), h("button", { class: "btn danger", onclick: rm("/api/categories/" + c.id, c.path) }, "Delete")))),
+      h("div", { class: "card" }, h("b", { text: "Merchant rules" }), h("p", { class: "muted", text: "Rules run before the AI. Create them by ticking “Always use this category” when reviewing." }),
+        ...(rules.length ? rules.map((r) => h("div", { class: "row", style: "padding:3px 0" }, h("span", { class: "grow", text: `${r.pattern} → ${r.category || "(any)"}${r.kind ? " · " + r.kind : ""}` }), h("button", { class: "btn danger", onclick: rm("/api/rules/" + r.id, "this rule") }, "Delete"))) : [h("p", { class: "muted", text: "No rules yet." })])),
+      h("div", { class: "card" }, h("b", { text: "Your data" }),
+        h("div", { class: "row", style: "margin-top:8px" },
+          h("button", { class: "btn", onclick: guard(() => download("/api/export.csv", "transactions-all.csv")) }, "Export CSV (all)"),
+          h("button", { class: "btn", onclick: guard(() => download("/api/export.json", "my-data.json")) }, "Export everything (JSON)"),
+          h("button", { class: "btn danger", onclick: guard(async () => { if (prompt('Type DELETE to erase every transaction and stored file') !== "DELETE") return; const r = await api("/api/data/wipe?confirm=DELETE", { method: "POST" }); toast(`Deleted ${r.deleted_transactions} records`); go("settings"); }) }, "Delete all data"))));
+  },
+};
+
+go("add");
+</script>
+</body>
+</html>

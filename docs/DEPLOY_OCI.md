@@ -18,9 +18,10 @@ It must live on its **own subdomain** (`receipts.abalakrishnan.in`), not a path 
 
 1. **Tunnel.** Zero Trust dashboard, Networks, Tunnels, Create a tunnel (Cloudflared), name it `receipts`. On the connector step copy the token (the string after `--token`). This is `CLOUDFLARE_TUNNEL_TOKEN`.
 2. **Public hostname** on that tunnel: subdomain `receipts`, domain `abalakrishnan.in`, path blank, service type **HTTP**, URL `receipt-tracker:8000`. Saving creates the DNS record for you.
-3. **Access application.** Access, Applications, Add, Self-hosted: name `Receipts`, domain `receipts.abalakrishnan.in`, **session duration 1 month** (so your phone stays signed in). Add a policy with action **Allow**, include **Emails** = your address. The default one-time-PIN login (a code emailed to you) works with no setup; add Google as an identity provider if you prefer.
-4. Copy two values into `app.env` later: the **AUD tag** (Access application, Overview) as `RT_ACCESS_AUD`, and your **team domain** (Settings, Custom pages, e.g. `yourteam.cloudflareaccess.com`) as `RT_ACCESS_TEAM_DOMAIN`. This is the same setup as hinty-word-pal.
-5. **Service token for the iPhone Shortcut** (skip if you have no iPhone): Access, Service Auth, Create service token. Copy the Client ID and Secret now, the secret is shown once. On the `Receipts` application add a second policy with action **Service Auth** that includes this token.
+3. **Sign in with Google, owner only (same as MarketBuddy).** Reuse the Google login method you already created for MarketBuddy: Zero Trust, Integrations, Identity providers (older dashboards: Settings, Authentication, Login methods). If you need a new one, register a Google OAuth client with the redirect URI `https://<your-team-domain>/cdn-cgi/access/callback` and paste its Client ID and Secret there.
+4. **Access application.** Access, Applications, Add, Self-hosted: name `Receipts`, domain `receipts.abalakrishnan.in`, **session duration 1 month** (so your phone stays signed in). Under identity providers select **only Google** and turn off one-time PIN, so nothing else can be used to sign in. Add a policy named `Owner only`, action **Allow**, include **Emails** = your own Google address, and add no other policy for people. Do not use "Everyone" here; that is right for a public game, wrong for your receipts.
+5. Copy two values into `app.env` later: the **AUD tag** (Access application, Overview) as `RT_ACCESS_AUD`, and your **team domain** (Settings, Custom pages, e.g. `yourteam.cloudflareaccess.com`) as `RT_ACCESS_TEAM_DOMAIN`. This is the same setup as hinty-word-pal.
+6. **Service token for the iPhone Shortcut** (skip if you have no iPhone): Access, Service Auth, Create service token. Copy the Client ID and Secret now, the secret is shown once. On the `Receipts` application add a second policy with action **Service Auth** that includes this token.
 
 ## 3. Install and configure the server
 
@@ -40,7 +41,7 @@ cp .env.example .env && cp app.env.example app.env && chmod 600 .env app.env
 
 `.env` holds only the tunnel token (and never reaches the app). Paste `CLOUDFLARE_TUNNEL_TOKEN` there. In `app.env`:
 
-- `RT_ACCESS_TEAM_DOMAIN` and `RT_ACCESS_AUD` from step 2.4. Optionally `RT_ACCESS_EMAILS=you@yourmail.com` as a second check inside the app.
+- `RT_ACCESS_TEAM_DOMAIN` and `RT_ACCESS_AUD` from step 2.5. Also set `RT_ACCESS_EMAILS=<your Google address>`: the app then double-checks the email in Access's token, so even a mistake in the Access policy (say, someone adds "Everyone") cannot let anyone else in.
 - `RT_PUBLIC_URL=https://receipts.abalakrishnan.in`
 - `RT_KEY`: run `docker compose run --rm --no-deps app python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` and paste the result. **Save a copy in your password manager now.** Without it, stored receipts and backups are unreadable.
 - `RT_LLM_API_KEY` (and `RT_LLM_BASE_URL` / `RT_MODEL` if not using OpenAI).

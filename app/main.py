@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Respo
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import auth, db, service
+from . import access, auth, db, service
 from .config import Settings
 from .crypto import Vault, load_key
 from .extractor import Extractor, build_extractor
@@ -66,10 +66,10 @@ class RuleIn(BaseModel):
 
 
 def create_app(settings: Settings | None = None, extractor: Extractor | None = None,
-               notify=None, mailbox_factory=None) -> FastAPI:
+               notify=None, mailbox_factory=None, access_key_client=None) -> FastAPI:
     settings = settings or Settings()
-    if settings.require_auth and not (settings.password_hash or settings.token):
-        raise RuntimeError("RT_REQUIRE_AUTH is set but neither RT_PASSWORD_HASH nor RT_TOKEN is; refusing to start an open server.")
+    if settings.require_auth and not (settings.password_hash or settings.token or settings.access_enabled):
+        raise RuntimeError("RT_REQUIRE_AUTH is set but no sign-in is configured (Cloudflare Access, RT_PASSWORD_HASH or RT_TOKEN); refusing to start an open server.")
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(settings.db_path)
     key = load_key(settings.data_dir, settings.fernet_key)
@@ -81,6 +81,10 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
     sessions = auth.Sessions(hashlib.sha256(b"session:" + key + settings.password_hash.encode()).digest(),
                              settings.session_days)
     limiter = auth.LoginLimiter()
+    verifier = (access.AccessVerifier(settings.access_team_domain, settings.access_aud,
+                                      {e.strip() for e in settings.access_emails.split(",") if e.strip()},
+                                      key_client=access_key_client)
+                if settings.access_enabled else None)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -106,7 +110,8 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
             conn.close()
 
     def auth_mode() -> str:
-        return "password" if settings.password_hash else "token" if settings.token else "open"
+        return ("access" if verifier else "password" if settings.password_hash
+                else "token" if settings.token else "open")
 
     def token_ok(request: Request) -> bool:
         supplied = request.headers.get("x-token", "")
@@ -114,8 +119,23 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
             supplied = request.headers["authorization"][7:]
         return bool(settings.token) and hmac.compare_digest(supplied, settings.token)
 
+    def access_claims(request: Request) -> dict | None:
+        return verifier.verify(request.headers.get(access.HEADER)) if verifier else None
+
+    def is_authenticated(request: Request) -> bool:
+        return (auth_mode() == "open" or token_ok(request) or access_claims(request) is not None
+                or (bool(settings.password_hash) and sessions.valid(request.cookies.get(auth.COOKIE))))
+
     def require_auth(request: Request) -> None:
         if auth_mode() == "open" or token_ok(request):
+            return
+        claims = access_claims(request)
+        if claims is not None:
+            # People signed in through Access hold an ambient browser cookie, so writes must come from our own page.
+            # Service tokens (scripts, the iPhone Shortcut) are sent deliberately and need no such header.
+            if (request.method not in ("GET", "HEAD") and not access.is_service_token(claims)
+                    and request.headers.get(auth.CSRF_HEADER) != auth.CSRF_VALUE):
+                raise HTTPException(status_code=403, detail="Missing request header")
             return
         if settings.password_hash and sessions.valid(request.cookies.get(auth.COOKIE)):
             # Cookie-authenticated writes must come from our own page (defence in depth beside SameSite=Strict).
@@ -165,10 +185,7 @@ def create_app(settings: Settings | None = None, extractor: Extractor | None = N
 
     @app.get("/api/session")
     def session(request: Request):
-        mode = auth_mode()
-        ok = mode == "open" or token_ok(request) or (
-            bool(settings.password_hash) and sessions.valid(request.cookies.get(auth.COOKIE)))
-        return {"mode": mode, "authenticated": ok}
+        return {"mode": auth_mode(), "authenticated": is_authenticated(request)}
 
     @app.post("/api/login")
     def login(body: LoginIn, request: Request, response: Response):

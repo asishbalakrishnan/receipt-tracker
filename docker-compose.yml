@@ -1,32 +1,35 @@
-# Receipt tracker behind Caddy (automatic HTTPS). Only Caddy is exposed to the internet.
+# Receipt tracker behind a Cloudflare Tunnel. No ports are published: cloudflared makes an outbound-only
+# connection to Cloudflare and reaches the app over the internal network. Cloudflare Access does the sign-in.
 services:
   app:
     build: .
+    container_name: receipt-tracker
     restart: unless-stopped
-    env_file: .env
+    env_file: app.env            # kept separate from .env so the tunnel token never reaches the app
     environment:
-      RT_REQUIRE_AUTH: "1"      # never start the internet-facing app without a login
+      RT_REQUIRE_AUTH: "1"       # never start the internet-facing app without a sign-in
     volumes:
       - rt_data:/data
     expose:
       - "8000"
+    networks:
+      - internal
 
-  caddy:
-    image: caddy:2
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: receipt-tunnel
     restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
     depends_on:
       - app
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      RT_DOMAIN: ${RT_DOMAIN:?set RT_DOMAIN in .env, for example receipts.abalakrishnan.in}
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
 
 volumes:
   rt_data:
-  caddy_data:
-  caddy_config:

@@ -16,7 +16,8 @@ self.addEventListener("fetch", (e) => {
   if (e.request.method === "POST" && url.pathname === "/share") {
     e.respondWith(receiveShare(e.request));
   } else if (e.request.mode === "navigate" && url.pathname === "/") {
-    e.respondWith(fetch(e.request).then((res) => { const copy = res.clone(); caches.open(SHELL).then((c) => c.put("/", copy)); return res; })
+    // Only remember a genuine page: never an Access sign-in redirect or an error.
+    e.respondWith(fetch(e.request).then((res) => { if (res.ok && res.type === "basic") { const copy = res.clone(); caches.open(SHELL).then((c) => c.put("/", copy)); } return res; })
       .catch(() => caches.match("/")));
   }
 });

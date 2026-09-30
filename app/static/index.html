@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Receipts</title>
-<link rel="manifest" href="/manifest.webmanifest">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#1f6f5c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Receipts">
@@ -132,6 +132,15 @@ const flagText = (f) => f.startsWith("low_confidence:") ? "Unsure about " + f.sp
 let token = localStorage.getItem("rt_token") || "";
 const CSRF = { "x-requested-with": "receipt-tracker" };
 let loginPromise = null;
+// Cloudflare Access answers an expired session with a redirect to its sign-in page. With redirect:"manual" that
+// shows up as an opaque redirect, which we can tell apart from a network failure.
+class SessionExpired extends Error { constructor() { super("Your sign-in has expired."); } }
+function reloadToSignIn() {   // top-level navigation lets Access show its sign-in page; guard against reload loops
+  const last = Number(sessionStorage.getItem("rt_reload") || 0);
+  if (Date.now() - last < 60000) return;
+  sessionStorage.setItem("rt_reload", String(Date.now()));
+  toast("Signing you in again…"); setTimeout(() => location.reload(), 800);
+}
 function needLogin() {
   if (loginPromise) return loginPromise;
   loginPromise = new Promise((resolve) => {
@@ -153,9 +162,11 @@ async function api(path, opts = {}) {
   const headers = { ...CSRF, ...(opts.headers || {}) };
   if (token) headers["x-token"] = token;
   if (opts.json !== undefined) { headers["content-type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
-  const res = await fetch(path, { ...opts, headers });
+  const res = await fetch(path, { ...opts, headers, redirect: "manual" });
+  if (res.type === "opaqueredirect") throw new SessionExpired();
   if (res.status === 401) {
     const sess = await fetch("/api/session").then((r) => r.json()).catch(() => ({}));
+    if (sess.mode === "access") throw new SessionExpired();
     if (sess.mode === "password") { await needLogin(); return api(path, opts); }
     const t = prompt("Access token");
     if (t) { token = t; localStorage.setItem("rt_token", t); return api(path, opts); }
@@ -189,7 +200,7 @@ async function refreshMeta() {
   S.processing = (await api("/api/transactions?status=processing")).length;
   if (!S.engine) S.engine = await api("/api/config");
   $("#engine").textContent = S.processing ? `Reading ${S.processing}…` : S.engine.extractor !== "none" ? "AI: " + S.engine.model : "AI off: manual entry only";
-  $("#signout").hidden = S.engine.mode !== "password";
+  $("#signout").hidden = !["password", "access"].includes(S.engine.mode);
 }
 function renderNav() {
   $("#nav").replaceChildren(...TABS.map(([id, label]) =>
@@ -225,9 +236,14 @@ async function sendFiles(files, combine) {
   try {
     return (await api("/api/receipts" + (combine ? "?combine=true" : ""), { method: "POST", body: fd })).results;
   } catch (e) {
-    if (!(e instanceof TypeError)) throw e;      // fetch throws TypeError when there is no network
-    try { await idb.add({ files: files.map((f) => ({ name: f.name, type: f.type, blob: f })), combine }); S.outbox = (await idb.all()).length; toast("No signal: saved on this phone and will be sent when you are back online"); return null; }
-    catch (_) { throw new Error("No connection, and this browser could not save the photo for later."); }
+    const expired = e instanceof SessionExpired;
+    if (!(e instanceof TypeError) && !expired) throw e;      // fetch throws TypeError when there is no network
+    try {
+      await idb.add({ files: files.map((f) => ({ name: f.name, type: f.type, blob: f })), combine }); S.outbox = (await idb.all()).length;
+      if (expired) { toast("Sign-in expired: saved on this phone, will be sent after you sign in"); reloadToSignIn(); }
+      else toast("No signal: saved on this phone and will be sent when you are back online");
+      return null;
+    } catch (_) { throw new Error(expired ? "Your sign-in expired and this browser could not save the photo for later." : "No connection, and this browser could not save the photo for later."); }
   }
 }
 // Send files, remember the new records so they show up as "Reading…", and return any per-file errors.
@@ -249,7 +265,7 @@ async function _flushOutbox() {
     const files = it.files.map((f) => new File([f.blob], f.name, { type: f.type }));
     const fd = new FormData(); for (const f of files) fd.append("files", f);
     try { const res = await api("/api/receipts" + (it.combine ? "?combine=true" : ""), { method: "POST", body: fd }); for (const r of res.results) for (const t of r.transactions || []) S.recentIds.unshift(t.id); await idb.del(it.id); sent++; }
-    catch (e) { if (e instanceof TypeError) break; throw e; }
+    catch (e) { if (e instanceof TypeError) break; if (e instanceof SessionExpired) { reloadToSignIn(); break; } throw e; }
   }
   try { S.outbox = (await idb.all()).length; } catch (_) {}
   if (sent) { toast(`Sent ${sent} receipt(s) that were waiting on this phone`); await refreshMeta(); renderNav(); schedulePoll(); }
@@ -465,7 +481,10 @@ const VIEWS = {
   },
 };
 
-$("#signout").addEventListener("click", async () => { await fetch("/api/logout", { method: "POST", headers: CSRF }); location.reload(); });
+$("#signout").addEventListener("click", async () => {
+  if (S.engine && S.engine.mode === "access") { location.href = "/cdn-cgi/access/logout"; return; }   // Cloudflare Access sign-out
+  await fetch("/api/logout", { method: "POST", headers: CSRF }); location.reload();
+});
 window.addEventListener("online", guard(flushOutbox));
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 (async () => { await guard(takeShared)(); await guard(flushOutbox)(); go("add"); })();

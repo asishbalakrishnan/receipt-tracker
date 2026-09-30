@@ -14,23 +14,24 @@ Upload a photo, PDF or forwarded email (.eml) of a receipt. A vision model reads
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # set RT_LLM_API_KEY (and RT_MODEL if not using OpenAI)
-export $(grep -v '^#' .env | xargs)
+cp app.env.example app.env      # set RT_LLM_API_KEY (and RT_MODEL if not using OpenAI)
+set -a; source app.env; set +a
 uvicorn app.main:app_factory --factory --port 8000
 ```
 
-Open http://localhost:8000. With no password or token set it is open, which is fine on your own machine only. Without a model key (or a local `RT_LLM_BASE_URL`) every upload is stored and sent to Review for manual entry. Camera and install need HTTPS, so for phones deploy it: **see [docs/DEPLOY_OCI.md](docs/DEPLOY_OCI.md)** (Docker, Caddy, backups, email, iPhone Shortcut).
+Open http://localhost:8000. With no password or token set it is open, which is fine on your own machine only. Without a model key (or a local `RT_LLM_BASE_URL`) every upload is stored and sent to Review for manual entry. Camera and install need HTTPS, so for phones deploy it: **see [docs/DEPLOY_OCI.md](docs/DEPLOY_OCI.md)** (Docker on OCI behind a Cloudflare Tunnel and Access, backups, email, iPhone Shortcut).
 
 Tests: `python3 -m pytest -q`
 
 ## Settings (env vars)
 
-Everything is documented in `.env.example`. The main ones:
+Everything is documented in `app.env.example` (`.env` holds only the Cloudflare tunnel token for docker compose). The main ones:
 
 | Variable | Purpose |
 |---|---|
-| `RT_PASSWORD_HASH` | Browser login (`python -m app.auth` creates it) |
-| `RT_TOKEN` | Long-lived API token for scripts and the iOS Shortcut (`Authorization: Bearer`) |
+| `RT_ACCESS_TEAM_DOMAIN`, `RT_ACCESS_AUD` | Cloudflare Access sign-in: the app verifies Access's signed token on every request (recommended) |
+| `RT_PASSWORD_HASH` | Password login when not using Access (`python -m app.auth` creates it) |
+| `RT_TOKEN` | Optional long-lived API token for scripts (`Authorization: Bearer`) |
 | `RT_LLM_API_KEY`, `RT_LLM_BASE_URL`, `RT_MODEL` | Model provider (any OpenAI-compatible endpoint) |
 | `RT_PDF_MODE`, `RT_JSON_MODE` | Provider quirks for PDFs and JSON replies |
 | `RT_KEY` | Encryption key for receipts and backups (otherwise generated in `data/secret.key`) |
@@ -64,8 +65,8 @@ Receipts never need to leave your machine if you use a local model, though small
 ## Back up and privacy
 
 - **Back up `data/secret.key`** (or your `RT_KEY`). Without it the stored receipts cannot be decrypted.
-- Only the original files are encrypted. The SQLite database (`data/app.db`) is not, so use full-disk encryption on the machine.
-- Receipt images go to the Anthropic API for reading. Check your account's data-retention terms.
+- Only the original files are encrypted. The SQLite database (`data/receipts.db`) is not, so use full-disk encryption on the machine.
+- Receipt images and text go to your model provider for reading. Check its data-retention terms, or use a local model.
 - Settings has full export (CSV, JSON) and a wipe-everything button.
 - Personal use is largely outside India's DPDP Act. Before opening this to other people you need the notice, consent, erasure, breach-reporting and processor steps in the Feature Set doc.
 
@@ -81,3 +82,5 @@ Multiple users and sync, native mobile app, WhatsApp intake, budgets and alerts,
 - Email intake is tested against a scripted stand-in for an IMAP server, not a real mailbox. Gmail's folder and expunge behaviour is from memory.
 - The Docker and OCI files have not been built or run: no Docker daemon was available where this was written. The compose file validates, and the app runs with the same server flags outside Docker.
 - Backups are tested for round-trip restore locally, not against OCI Object Storage.
+- Cloudflare Access sign-in is tested with locally generated keys, not against real Cloudflare: wrong signature, audience, issuer, expiry and unsigned tokens are refused, but nothing has been checked against your actual team. Dashboard steps in the guide are from memory.
+- The handling of an expired Access session is tested by simulating the redirect in a browser, not with real Cloudflare.

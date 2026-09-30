@@ -21,6 +21,10 @@ class Settings:
     fernet_key: str = field(default_factory=lambda: os.environ.get("RT_KEY", ""))
     token: str = field(default_factory=lambda: os.environ.get("RT_TOKEN", ""))  # long-lived API token for scripts and Shortcuts
     password_hash: str = field(default_factory=lambda: os.environ.get("RT_PASSWORD_HASH", ""))  # browser login (python -m app.auth)
+    # Cloudflare Access (Zero Trust). Set both to require a valid Access token on every request.
+    access_team_domain: str = field(default_factory=lambda: os.environ.get("RT_ACCESS_TEAM_DOMAIN", ""))  # yourteam.cloudflareaccess.com
+    access_aud: str = field(default_factory=lambda: os.environ.get("RT_ACCESS_AUD", ""))  # the Access application's AUD tag
+    access_emails: str = field(default_factory=lambda: os.environ.get("RT_ACCESS_EMAILS", ""))  # optional extra check, comma-separated
     require_auth: bool = field(default_factory=lambda: os.environ.get("RT_REQUIRE_AUTH", "0") == "1")  # refuse to start with no login (set in docker-compose)
     session_days: int = field(default_factory=lambda: int(os.environ.get("RT_SESSION_DAYS", "30")))
     sync_ingest: bool = field(default_factory=lambda: os.environ.get("RT_SYNC_INGEST", "0") == "1")  # read receipts inside the upload request (tests)
@@ -46,6 +50,10 @@ class Settings:
     public_url: str = field(default_factory=lambda: os.environ.get("RT_PUBLIC_URL", ""))
     max_upload_bytes: int = 15 * 1024 * 1024
     few_shot_corrections: int = 20
+
+    @property
+    def access_enabled(self) -> bool:
+        return bool(self.access_team_domain and self.access_aud)
 
     @property
     def allowed_senders(self) -> set[str]:
